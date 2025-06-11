@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller
+build/
+dist/
+
+# Qt plugins (if you bundle any)
+plugins/
+
+# IDEs and editors
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.idea/
+
+# Logs and virtualenv
+*.log
+.env/
+venv/
