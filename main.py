@@ -361,9 +361,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         self.iface_x = iface_x
         self.iface_y = iface_y
         self.iface_z = iface_z
-        
-        # Track which axes have had a watchdog spawned
-        self._watchdog_spawned_axes = set()
 
         # Keep track of display‐unit multiplier (always mm for simplicity here):
         self.display_unit = "mm"
@@ -602,27 +599,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         btn_connect: QtWidgets.QPushButton = getattr(self, f"button_Connect{axis}")
         if connected:
             btn_connect.setText(f"Disconnect {axis}")
-            # ─── Spawn a detached watchdog for this axis ─────────────────────────
-            if axis not in self._watchdog_spawned_axes:
-                import subprocess, sys, os
-    
-                parent_pid = os.getpid()
-                serial = getattr(self, f"iface_{axis}").instrument.serial_number
-                script = os.path.join(os.path.dirname(__file__), 'watchdog.py')
-                cmd = [
-                    sys.executable, script,
-                    '--pid', str(parent_pid),
-                    '--axes', f"{axis}:{serial}",
-                    '--interval', '1.0'
-                ]
-                # Detach so it lives on after GUI kill
-                if os.name == 'nt':
-                    DETACHED = 0x00000008
-                    subprocess.Popen(cmd, creationflags=DETACHED)
-                else:
-                    subprocess.Popen(cmd, start_new_session=True)
-    
-                self._watchdog_spawned_axes.add(axis)
         else:
             btn_connect.setText(f"Connect {axis}")
 
@@ -774,10 +750,10 @@ class MultiAxisGui(QtWidgets.QWidget):
         """
         
         # CRASHER ─────────────────────────────────────────────────────
-        jog_timer = self.continuous_timers[axis]
-        if jog_timer.isActive():
-            jog_timer.stop()
-            jog_timer.disconnect()
+        # jog_timer = self.continuous_timers[axis]
+        # if jog_timer.isActive():
+        #     jog_timer.stop()
+        #     jog_timer.disconnect()
         # CRASHER ─────────────────────────────────────────────────────
         
         # Gracefully decelerate the motor if it was in “move_velocity” mode:
