@@ -177,26 +177,11 @@ class interface(QtCore.QObject):
         """
         When called, the motor decelerates smoothly to a stop (profiled).
         """
-        orig_acc = None
-        try:
-            orig_acc = self.instrument.acceleration
-            # Temporarily raise accel for a steeper decel ramp
-            self.instrument.acceleration = orig_acc * 1000
-        except Exception:
-            orig_acc = None
-
         try:
             self.instrument.stop_profiled()
         except Exception:
             pass
-
-        # Restore original acceleration
-        if orig_acc is not None:
-            try:
-                self.instrument.acceleration = orig_acc
-            except Exception:
-                pass
-
+        
         # Notify GUI of movement end
         self.sig_change_moving_status.emit(self.SIG_MOVEMENT_ENDED)
 
@@ -408,7 +393,7 @@ class MultiAxisGui(QtWidgets.QWidget):
         # Ensure keyPressEvent works:
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setFocus()
-
+        
     def _build_axis_group(self, axis_label: str, iface: interface, allow_drive: bool) -> QtWidgets.QGroupBox:
         """
         Build a QGroupBox containing all controls for one axis (Label e.g. "X").
@@ -490,10 +475,12 @@ class MultiAxisGui(QtWidgets.QWidget):
         # --- Row 4: Position display, Move < / >, Step size, Home, Stop ---
         hlay4 = QtWidgets.QHBoxLayout()
         label_pos = QtWidgets.QLabel(f"{axis_label} Position:")
-        edit_pos = QtWidgets.QLineEdit("0.0000")
+        edit_pos = QtWidgets.QLineEdit("0.000")
         edit_pos.setAlignment(QtCore.Qt.AlignRight)
         btn_move_neg = QtWidgets.QPushButton("<")
         btn_move_pos = QtWidgets.QPushButton(">")
+        btn_move_neg.setFocusPolicy(QtCore.Qt.NoFocus)
+        btn_move_pos.setFocusPolicy(QtCore.Qt.NoFocus)
         label_by = QtWidgets.QLabel("By:")  # we'll set text and show/hide later
         edit_step = QtWidgets.QLineEdit(str(iface.settings['step_size']*MM_TO_UM))
         btn_home = QtWidgets.QPushButton(f"Home {axis_label}")
@@ -550,6 +537,16 @@ class MultiAxisGui(QtWidgets.QWidget):
         edit_step.returnPressed.connect(lambda ax=axis_label: self._press_enter_step(ax))
         edit_vel.returnPressed.connect(lambda ax=axis_label: self._press_enter_velocity(ax))
         edit_acc.returnPressed.connect(lambda ax=axis_label: self._press_enter_accel(ax))
+        
+        edit_pos.returnPressed.disconnect()
+        edit_pos.editingFinished.connect(lambda ax=axis_label: self._press_enter_position(ax))
+        edit_step.returnPressed.disconnect()
+        edit_step.editingFinished.connect(lambda ax=axis_label: self._press_enter_step(ax))
+        edit_vel.returnPressed.disconnect()
+        edit_vel.editingFinished.connect(lambda ax=axis_label: self._press_enter_velocity(ax))
+        edit_acc.returnPressed.disconnect()
+        edit_acc.editingFinished.connect(lambda ax=axis_label: self._press_enter_accel(ax))
+        
         btn_home.clicked.connect(lambda _, ax=axis_label: self._home_clicked(ax))
         btn_stop.clicked.connect(lambda _, ax=axis_label: self._stop_clicked(ax))
 
@@ -661,6 +658,9 @@ class MultiAxisGui(QtWidgets.QWidget):
             iface.set_position(str(pos_mm))
         except ValueError:
             pass
+        self.window().activateWindow()
+        # 2) put focus explicitly back on the widget that handles keyPressEvent
+        self.setFocus(QtCore.Qt.TabFocusReason)
 
     def _press_enter_step(self, axis: str):
         """
@@ -674,6 +674,39 @@ class MultiAxisGui(QtWidgets.QWidget):
             iface.set_step_size(str(step_mm))
         except ValueError:
             pass
+        self.window().activateWindow()
+        # 2) put focus explicitly back on the widget that handles keyPressEvent
+        self.setFocus(QtCore.Qt.TabFocusReason)
+        
+    def _press_enter_velocity(self, axis: str):
+        """User typed a new Velocity (in µm/s). Convert → mm/s and send."""
+        try:
+            disp_vel = float(getattr(self, f"edit_Velocity{axis}").text())
+            vel_mm_s = disp_vel * UM_TO_MM
+            # grab the current accel so we don't clobber it:
+            _, acc_mm_s2 = self._read_jog_params(axis)
+            iface = getattr(self, f"iface_{axis}")
+            iface.set_velocity_profile(vel_mm_s, acc_mm_s2)
+        except ValueError:
+            pass
+        self.window().activateWindow()
+        # 2) put focus explicitly back on the widget that handles keyPressEvent
+        self.setFocus(QtCore.Qt.TabFocusReason)
+
+    def _press_enter_accel(self, axis: str):
+        """User typed a new Acceleration (in µm/s²). Convert → mm/s² and send."""
+        try:
+            disp_acc = float(getattr(self, f"edit_Accel{axis}").text())
+            acc_mm_s2 = disp_acc * UM_TO_MM
+            # grab the current velocity so we don't clobber it:
+            vel_mm_s, _ = self._read_jog_params(axis)
+            iface = getattr(self, f"iface_{axis}")
+            iface.set_velocity_profile(vel_mm_s, acc_mm_s2)
+        except ValueError:
+            pass
+        self.window().activateWindow()
+        # 2) put focus explicitly back on the widget that handles keyPressEvent
+        self.setFocus(QtCore.Qt.TabFocusReason)
 
     def _home_clicked(self, axis: str):
         iface: interface = getattr(self, f"iface_{axis}")
@@ -729,9 +762,14 @@ class MultiAxisGui(QtWidgets.QWidget):
             # (a) SINGLE‐CLICK: use the shared helper to read params, then one step
             if getattr(self, f"radio_Single{axis}").isChecked():
                 if not iface.is_device_moving():
-                    vel_mm_s, accn_mm_s2 = self._read_jog_params(axis)
-                    iface.set_velocity_profile(vel_mm_s, accn_mm_s2)
+                    # pull in the latest user-typed step size
+                    self._press_enter_step(axis)
+                    vel, acc = self._read_jog_params(axis)
+                    iface.set_velocity_profile(vel, acc)
                     iface.move_single_step(direction)
+                    poll_t = self.position_poll_timers[axis]
+                    if not poll_t.isActive():
+                        poll_t.start()
                 return
 
             # Continuous:
@@ -744,7 +782,7 @@ class MultiAxisGui(QtWidgets.QWidget):
             self._start_continuous(axis, direction)
             return
 
-    def _arrow_released(self, axis: str):
+    def _arrow_released(self, axis: str, direction: int):
         """
         Called when < or > button is released.  Stop any QTimer for that axis.
         """
@@ -756,11 +794,21 @@ class MultiAxisGui(QtWidgets.QWidget):
         #     jog_timer.disconnect()
         # CRASHER ─────────────────────────────────────────────────────
         
+        mode = getattr(self, f"combo_Mode{axis}").currentText()
+        single  = getattr(self, f"radio_Single{axis}").isChecked()
+        # if we’re in single-click jog, *don’t* stop the move here
+        if mode == "Jog" and single:
+            return
+        
         # Gracefully decelerate the motor if it was in “move_velocity” mode:
         iface: interface = getattr(self, f"iface_{axis}")
         if iface.connected_device_name and iface.is_device_moving():
             # Ask the motor to stop profiled (ramps down).
-            iface.stop_profiled_continuous()
+            orig = iface.instrument.acceleration         # save current accel
+            vel, acc = self._read_jog_params(axis)
+            iface.set_velocity_profile(0, orig)
+            iface.move_velocity_continuous(direction)
+            iface.instrument.stop_profiled()             
 
             # (3) Keep polling until the motor actually stops before we fully clear “moving”:
             #     We do this by starting a short QTimer that watches `is_in_motion` → false.
@@ -834,17 +882,20 @@ class MultiAxisGui(QtWidgets.QWidget):
 
         # X-axis: A or D released
         if key in (QtCore.Qt.Key_A, QtCore.Qt.Key_D) and not event.isAutoRepeat():
-            self._arrow_released("X")
+            direction = -1 if key == QtCore.Qt.Key_A else +1
+            self._arrow_released("X", direction)
             return
 
         # Y-axis: W or S released
         if key in (QtCore.Qt.Key_W, QtCore.Qt.Key_S) and not event.isAutoRepeat():
-            self._arrow_released("Y")
+            direction = +1 if key == QtCore.Qt.Key_W else -1
+            self._arrow_released("Y", direction)
             return
-
+        
         # Z-axis: Up or Down released
         if key in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down) and not event.isAutoRepeat():
-            self._arrow_released("Z")
+            direction = +1 if key == QtCore.Qt.Key_Up else -1
+            self._arrow_released("Z", direction)
             return
 
         super().keyReleaseEvent(event)
