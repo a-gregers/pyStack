@@ -665,10 +665,16 @@ class MultiAxisGui(QtWidgets.QWidget):
         """
         Called when the Mode combo changes (Jog <-> Drive).
         If new_mode == "Drive", hide the Jog sub-mode row; else show it.
+        Also stop any active position-poll timers for this axis.
         """
         widget_row3: QtWidgets.QWidget = getattr(self, f"widget_JogOptions{axis}")
+        # Show or hide the jog options row
         if new_mode == "Drive":
             widget_row3.hide()
+            # Stop any active position-poll timer for this axis
+            timer = self.position_poll_timers[axis]
+            if timer.isActive():
+                timer.stop()
         else:
             widget_row3.show()
 
@@ -841,15 +847,15 @@ class MultiAxisGui(QtWidgets.QWidget):
             try:
                 # read back whatever max-vel is currently set
                 threshold_mm_s = 100.0 * UM_TO_MM
-                _, current_acc, current_maxv = iface.instrument.get_velocity_parameters()
+                vel, acc = self._read_jog_params(axis)
     
-                if current_maxv > threshold_mm_s:
+                if vel > threshold_mm_s:
                     # above threshold → smooth, profiled stop
                     iface.instrument.stop_profiled()
                 else:
                     # below threshold → zero-vel “sudden” stop
                     # (set max_vel = 0 so motor brakes instantly)
-                    iface.set_velocity_profile(0.0, current_acc)
+                    iface.set_velocity_profile(0.0, acc)
                     iface.move_velocity_continuous(direction)
                     iface.instrument.stop_profiled()
             except Exception as e:
@@ -944,29 +950,6 @@ class MultiAxisGui(QtWidgets.QWidget):
             return
 
         super().keyReleaseEvent(event)
-
-
-    # ───────────────────────────────────────────────────────────────────────────
-    def _on_mode_changed(self, axis: str, new_mode: str):
-        """
-        Show or hide the Jog sub‐mode row when Mode changes.
-        """
-        widget_row3: QtWidgets.QWidget = getattr(self, f"widget_JogOptions{axis}")
-        if new_mode == "Drive":
-            widget_row3.hide()
-            # Ensure no jog timer is active
-            timer = self.continuous_timers[axis]
-            if timer.isActive():
-                timer.stop()
-                timer.disconnect()
-        else:
-            widget_row3.show()
-            # Ensure no drive timer is active
-            timer = self.continuous_timers[axis]
-            if timer.isActive():
-                timer.stop()
-                timer.disconnect()
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 class MainWindow(QtWidgets.QMainWindow):
