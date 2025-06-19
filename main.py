@@ -84,6 +84,10 @@ class interface(QtCore.QObject):
 
         # Immediately refresh device list:
         QtCore.QTimer.singleShot(0, self.refresh_list_devices)
+        
+        # Track the last‐set velocity (mm/s) for threshold logic:
+        self._last_velocity = 0.0
+        self._last_acceleration = 0.0
 
     def refresh_list_devices(self):
         """
@@ -145,15 +149,37 @@ class interface(QtCore.QObject):
             return False
 
     def stop_any_movement(self):
-        if self.is_device_moving():
-            try:
+        if not self.is_device_moving():
+            return
+
+        # threshold = 100 µm/s → in mm/s:
+        threshold_mm_s = 100.0 * UM_TO_MM
+        try:
+            # read back whatever max-vel is currently set
+            _, current_acc, current_maxv = self.instrument.get_velocity_parameters()
+            print(f"[DEBUG] stop_any_movement: max_v = {current_maxv:.4f} mm/s   threshold = {threshold_mm_s:.4f} mm/s")
+
+            if current_maxv > threshold_mm_s:
+                # above threshold → smooth, profiled stop
                 self.instrument.stop_profiled()
-            except Exception as e:
-                print(f"[ERROR] stop_any_movement failed: {e}")
+            else:
+                # below threshold → zero-vel “sudden” stop
+                # (set max_vel = 0 so motor brakes instantly)
+                # self.instrument.set_velocity_profile(0.0, current_acc, 0.0)
+                self.set_velocity_profile(0.0, current_acc)
+                self.move_velocity_continuous(1)
+                self.instrument.stop_profiled()
+                self.instrument.stop_profiled()
+        except Exception as e:
+            print(f"[ERROR] stop_any_movement failed: {e}")
+        finally:
             self.sig_change_moving_status.emit(self.SIG_MOVEMENT_ENDED)
             
     def set_velocity_profile(self, vel_mm_s: float, accn_mm_s2: float):
         try:
+            # remember what we just commanded
+            self._last_velocity     = vel_mm_s
+            self._last_acceleration = accn_mm_s2
             self.instrument.set_velocity_parameters(0.0, accn_mm_s2, vel_mm_s)
         except Exception as e:
             # Log any hardware/API errors so they're visible
@@ -511,6 +537,9 @@ class MultiAxisGui(QtWidgets.QWidget):
             hlay4.addWidget(w)
         hlay4.addStretch(1)
         vlay.addLayout(hlay4)
+        
+        self.installEventFilter(self)
+        QtWidgets.qApp.installEventFilter(self)
 
         # --- Connect signals → slots for this axis ---
         iface.sig_list_devices_updated.connect(lambda lst, ax=axis_label: self._on_list_devices_updated(ax, lst))
@@ -659,7 +688,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         except ValueError:
             pass
         self.window().activateWindow()
-        # 2) put focus explicitly back on the widget that handles keyPressEvent
         self.setFocus(QtCore.Qt.TabFocusReason)
 
     def _press_enter_step(self, axis: str):
@@ -675,7 +703,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         except ValueError:
             pass
         self.window().activateWindow()
-        # 2) put focus explicitly back on the widget that handles keyPressEvent
         self.setFocus(QtCore.Qt.TabFocusReason)
         
     def _press_enter_velocity(self, axis: str):
@@ -690,7 +717,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         except ValueError:
             pass
         self.window().activateWindow()
-        # 2) put focus explicitly back on the widget that handles keyPressEvent
         self.setFocus(QtCore.Qt.TabFocusReason)
 
     def _press_enter_accel(self, axis: str):
@@ -705,7 +731,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         except ValueError:
             pass
         self.window().activateWindow()
-        # 2) put focus explicitly back on the widget that handles keyPressEvent
         self.setFocus(QtCore.Qt.TabFocusReason)
 
     def _home_clicked(self, axis: str):
@@ -715,6 +740,16 @@ class MultiAxisGui(QtWidgets.QWidget):
     def _stop_clicked(self, axis: str):
         iface: interface = getattr(self, f"iface_{axis}")
         iface.stop_any_movement()
+        
+    def _stop_all(self):
+        """Stop any motion on X, Y, and Z immediately."""
+        for ax in ("X", "Y", "Z"):
+            iface = getattr(self, f"iface_{ax}")
+            try:
+                iface.stop_any_movement()
+            except Exception:
+                # you can log or ignore if one axis isn’t moving
+                pass
 
     def _read_jog_params(self, axis: str):
         """
@@ -803,12 +838,22 @@ class MultiAxisGui(QtWidgets.QWidget):
         # Gracefully decelerate the motor if it was in “move_velocity” mode:
         iface: interface = getattr(self, f"iface_{axis}")
         if iface.connected_device_name and iface.is_device_moving():
-            # Ask the motor to stop profiled (ramps down).
-            orig = iface.instrument.acceleration         # save current accel
-            vel, acc = self._read_jog_params(axis)
-            iface.set_velocity_profile(0, orig)
-            iface.move_velocity_continuous(direction)
-            iface.instrument.stop_profiled()             
+            try:
+                # read back whatever max-vel is currently set
+                threshold_mm_s = 100.0 * UM_TO_MM
+                _, current_acc, current_maxv = iface.instrument.get_velocity_parameters()
+    
+                if current_maxv > threshold_mm_s:
+                    # above threshold → smooth, profiled stop
+                    iface.instrument.stop_profiled()
+                else:
+                    # below threshold → zero-vel “sudden” stop
+                    # (set max_vel = 0 so motor brakes instantly)
+                    iface.set_velocity_profile(0.0, current_acc)
+                    iface.move_velocity_continuous(direction)
+                    iface.instrument.stop_profiled()
+            except Exception as e:
+                print(f"[ERROR] stop failed for {axis} motor: {e}")
 
             # (3) Keep polling until the motor actually stops before we fully clear “moving”:
             #     We do this by starting a short QTimer that watches `is_in_motion` → false.
