@@ -83,7 +83,8 @@ class interface(QtCore.QObject):
             self.instrument = driver_real.pyThorlabsAPT()
 
         # Immediately refresh device list:
-        QtCore.QTimer.singleShot(0, self.refresh_list_devices)
+        QtCore.QTimer.singleShot(0,   self.refresh_list_devices)
+        QtCore.QTimer.singleShot(200, self.refresh_list_devices)
         
         # Track the last‐set velocity (mm/s) for threshold logic:
         self._last_velocity = 0.0
@@ -368,6 +369,13 @@ class interface(QtCore.QObject):
 class MultiAxisGui(QtWidgets.QWidget):
     def __init__(self, iface_x: interface, iface_y: interface, iface_z: interface, parent=None):
         super().__init__(parent)
+        
+        # Only show these serials per axis if they’re present:
+        self.assigned_serials = {
+            'X': '26006151',
+            'Y': '26006139',
+            'Z': '26002801',
+        }
 
         self.iface_x = iface_x
         self.iface_y = iface_y
@@ -434,6 +442,9 @@ class MultiAxisGui(QtWidgets.QWidget):
         hlay1 = QtWidgets.QHBoxLayout()
         label_dev = QtWidgets.QLabel(f"{axis_label} Device:")
         combo_dev = QtWidgets.QComboBox()
+        combo_dev.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToContents
+        )
         btn_refresh = QtWidgets.QPushButton(f"Refresh {axis_label}")
         btn_connect = QtWidgets.QPushButton(f"Connect {axis_label}")
 
@@ -619,7 +630,18 @@ class MultiAxisGui(QtWidgets.QWidget):
     def _on_list_devices_updated(self, axis: str, lst: list):
         combo: QtWidgets.QComboBox = getattr(self, f"combo_Device{axis}")
         combo.clear()
-        combo.addItems(lst)
+    
+        # pick the serial we’re allowed to show for this axis
+        assigned = self.assigned_serials.get(axis)
+        if not assigned:
+            return
+    
+        # lst entries look like "SERIAL --> MODEL"
+        filtered = [item for item in lst
+                    if item.startswith(f"{assigned} →") or item.split(' --> ')[0] == assigned]
+        for i,v in enumerate(filtered):
+            filtered[i] = filtered[i].split(' --> ')[0]
+        combo.addItems(filtered)
 
     def _on_connection_status_change(self, axis: str, connected: bool):
         btn_connect: QtWidgets.QPushButton = getattr(self, f"button_Connect{axis}")
@@ -648,8 +670,55 @@ class MultiAxisGui(QtWidgets.QWidget):
         pass  # no stage info fields shown currently
 
     def _refresh_clicked(self, axis: str):
+        """
+        Hard-refresh this axis: disconnect if needed, rebuild the driver,
+        then retry scanning up to 5 times (200 ms apart) until the assigned
+        serial shows up—or else warn the user.
+        """
         iface: interface = getattr(self, f"iface_{axis}")
-        iface.refresh_list_devices()
+
+        # 1) Tear down any existing connection
+        if iface.connected_device_name:
+            try:
+                iface.disconnect_device()
+            except Exception:
+                pass
+
+        # 2) Recreate the instrument wrapper
+        if iface.use_virtual:
+            iface.instrument = driver_virtual.pyThorlabsAPT()
+        else:
+            iface.instrument = driver_real.pyThorlabsAPT()
+
+        # 3) Now do up to N scans, spaced out, until we see the serial
+        max_retries = 5
+        delay_ms   = 200
+        attempt    = {'count': 0}
+        assigned   = self.assigned_serials.get(axis)
+
+        def do_scan():
+            # emit a new list into the combo
+            iface.refresh_list_devices()
+            attempt['count'] += 1
+
+            # if we’ve found our assigned device, stop retrying
+            if assigned and any(dev.startswith(assigned) for dev in iface.list_devices):
+                return
+
+            if attempt['count'] < max_retries:
+                QtCore.QTimer.singleShot(delay_ms, do_scan)
+            else:
+                # give up — warn the user
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    f"{axis}-axis Motor Not Found",
+                    f"Could not detect {axis}-axis motor\n"
+                    f"(S/N {assigned}) after {max_retries} scans.\n"
+                    "Please check its USB connection or restart the GUI."
+                )
+
+        # kick off the first scan immediately
+        do_scan()
 
     def _connect_clicked(self, axis: str):
         combo: QtWidgets.QComboBox = getattr(self, f"combo_Device{axis}")
