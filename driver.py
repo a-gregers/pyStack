@@ -25,13 +25,11 @@ class pyThorlabsAPT(apt.Motor):
             A list of all found valid devices. Each element of the list is a list of three strings, in the format [identity,address]
 
         '''
-        apt_core._cleanup()                         #By calling the _cleanup method here, we make sure that list_devices can discover devices that were plugged in after the creation of this object
-        apt_core._lib = apt_core._load_library()
         self.list_valid_devices = apt.list_available_devices()
         return self.list_valid_devices
     
     def connect_device(self,device_addr):
-        #self.list_devices()
+        # self.list_devices()
         device_addresses = [str(dev[1]) for dev in self.list_valid_devices]
         if (str(device_addr) in device_addresses):     
             try:
@@ -50,22 +48,12 @@ class pyThorlabsAPT(apt.Motor):
         return (Msg,ID)
 
     def disconnect_device(self):
-        if(self.connected == True):
-            try:   
-                apt_core._cleanup()
-                self.list_devices()
-                ID = 1
-                Msg = 'Succesfully disconnected.'
-            except Exception as e:
-                ID = 0 
-                Msg = e
-            if(ID==1):
-                self.connected = False
-            return (Msg,ID)
-        else:
-            apt_core._cleanup()
-            self.list_devices()
+        if not self.connected:
             raise RuntimeError("Device is already disconnected.")
+
+        # Only drop the connection flag; leave the DLL loaded
+        self.connected = False
+        return ("Successfully disconnected.", 1)
             
 
 

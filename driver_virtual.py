@@ -54,22 +54,12 @@ class pyThorlabsAPT():
         return (Msg,ID)
 
     def disconnect_device(self):
-        if(self.connected == True):
-            try:   
-                #apt_core._cleanup()
-                self.list_devices()
-                ID = 1
-                Msg = 'Succesfully disconnected.'
-            except Exception as e:
-                ID = 0 
-                Msg = e
-            if(ID==1):
-                self.connected = False
-            return (Msg,ID)
-        else:
-            #apt_core._cleanup()
-            self.list_devices()
+        if not self.connected:
             raise RuntimeError("Device is already disconnected.")
+
+        # Only drop the connection flag; leave the DLL loaded
+        self.connected = False
+        return ("Successfully disconnected.", 1)
     
     #Function to simulate a real stage. They mimic the functions in core.py
 
