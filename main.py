@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
 )
 from pyThorlabsAPT.thorlabs_apt import core as apt_core
 from dataclasses import dataclass
-
+from pathlib import Path
 
 apt_core._lib = apt_core._load_library()
 dirname = os.path.dirname(PyQt5.__file__)
@@ -753,13 +753,25 @@ class MultiAxisGui(QtWidgets.QWidget):
            
         btn_load.clicked.connect(self.load_preset)
         btn_go.clicked.connect(self.go_preset)
-        default = os.path.join(os.path.dirname(__file__), "target.json")
-        if os.path.exists(default):
+        # 1) Look in ~/Documents/target.json first, then fall back to the script’s folder
+        docs_preset   = Path.home() / "Documents" / "target.json"
+        script_preset = Path(__file__).parent / "target.json"
+        
+        if docs_preset.exists():
+            preset_path = docs_preset
+        elif script_preset.exists():
+            preset_path = script_preset
+        else:
+            preset_path = None
+        
+        # 2) If we found one, load it
+        if preset_path:
             try:
-                with open(default, 'r') as f:
+                with open(preset_path, 'r') as f:
                     data = json.load(f)
                 self._apply_preset_dict(data, show_message=False)
-                self.label_PresetStatus.setText(f"Preset: {os.path.basename(default)}")
+                # update the status label to show which file we loaded
+                self._label_PresetStatus.setText(f"Preset: {preset_path.name}")
             except Exception:
                 # leave status as “None” on parse error
                 pass
@@ -1436,11 +1448,11 @@ class MultiAxisGui(QtWidgets.QWidget):
         # 3) Store
         self._preset = dict(x_mm=x_mm, y_mm=y_mm, vel=vel_mm, acc=acc_mm)
         # 4) Update UI
-        self.label_PresetStatus.setText(f"Preset: {x_um:.0f}×{y_um:.0f} µm")
+        self.label_PresetStatus.setText(f"Preset position: ({x_um:.1f}, {y_um:.1f}) µm")
         if show_message:
             QtWidgets.QMessageBox.information(
                 self, "Preset Loaded",
-                f"X={x_um:.0f} µm, Y={y_um:.0f} µm\n"
+                f"X={x_um:.3f} µm, Y={y_um:.3f} µm\n"
                 f"Vel={vel_um:.1f} µm/s, Acc={acc_um:.1f} µm/s²"
             )
 
