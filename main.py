@@ -3,12 +3,14 @@ import os, json, time, argparse, atexit, PyQt5, threading
 import pyThorlabsAPT.driver as driver_real
 import pyThorlabsAPT.driver_virtual as driver_virtual
 from PyQt5 import QtWidgets, QtCore, QtGui
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QEvent
 from PyQt5.QtGui import QDoubleValidator
 from PyQt5.QtWidgets import (
     QDialog, QListWidget, QListWidgetItem,
     QVBoxLayout, QHBoxLayout, QPushButton,
-    QStackedWidget, QSizePolicy, QCheckBox
+    QStackedWidget, QSizePolicy, QCheckBox, 
+    QLabel, QLineEdit, QComboBox, QDoubleSpinBox,
+    QAbstractSpinBox
 )
 from pyThorlabsAPT.thorlabs_apt import core as apt_core
 from dataclasses import dataclass
@@ -37,7 +39,7 @@ sys._excepthook = sys.excepthook
 sys.excepthook = exception_hook
 # 
 
-print(f"[DEBUG] {time.strftime('%H:%M:%S')}  :  Entering pyThorlabsAPT (main module).")
+print(f"[DEBUG] {time.strftime('%H:%M:%S')}  :  Entering pyStack (main module).")
 
 UM_TO_MM = 1e-3      # microns to millimeters
 MM_TO_UM = 1e3       # millimeters to microns
@@ -91,6 +93,8 @@ class interface(QtCore.QObject):
         self.connected_device_name = ''
         self.output = {'Position': 0.0}
         self._units = {'mm': 1, 'deg': 2}
+        self._actual_homing = {ax: False for ax in ("X","Y","Z")}
+        self._homing_requested = {ax: False for ax in ("X","Y","Z")}
 
         # Pick driver:
         if self.use_virtual:
@@ -133,6 +137,7 @@ class interface(QtCore.QObject):
                 self.read_stage_info()
                 self.sig_change_moving_status.emit(self.SIG_MOVEMENT_ENDED)
                 self.sig_change_homing_status.emit(self.SIG_HOMING_ENDED)
+                self._default_home_params = self.instrument.get_move_home_parameters()
                 self.sig_connected.emit(True)
             else:
                 self.connected_device_name = ''
@@ -184,10 +189,12 @@ class interface(QtCore.QObject):
                 # self.instrument.set_velocity_profile(0.0, current_acc, 0.0)
                 self.set_velocity_profile(0.0, current_acc)
                 self.move_velocity_continuous(1)
-                self.instrument.stop_profiled()
+                self.instrument.stop_profiled() 
         except Exception as e:
             print(f"[ERROR] stop_any_movement failed: {e}")
         finally:
+            for ax in ["X", "Y", "Z"]:
+                self._actual_homing[ax] = False
             self.sig_change_moving_status.emit(self.SIG_MOVEMENT_ENDED)
             
     def set_velocity_profile(self, vel_mm_s: float, accn_mm_s2: float):
@@ -418,9 +425,6 @@ class PollerThread(QtCore.QThread):
                         # skip this cycle (don’t kill the other axes)
                         self.msleep(self._interval_ms)
                         continue
-            
-                    # APT’s “forward” code is actually your REV‐limit,
-                    # and APT’s “reverse” code is your FWD‐limit
     
                     self.switchUpdated.emit(ax, rev, fwd)
                     
@@ -664,6 +668,150 @@ class ConnectDevicesDialog(QDialog):
         finally:
             for ax in ("X","Y","Z"):
                 getattr(self.gui, f"iface_{ax}")._lock.release()
+                
+class FocusWheelSpinBox(QDoubleSpinBox):
+    """
+    A QDoubleSpinBox that only responds to the mouse wheel when it has focus,
+    and always forwards focus/clicks to its inner QLineEdit so you can type.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ensure click/tab focus goes right into the editor
+        self.setFocusPolicy(Qt.StrongFocus)
+        # (removed setFocusProxy to avoid “already in focus proxy chain” warnings)
+        # catch inner‐editor focus‐out events
+        self.lineEdit().installEventFilter(self)
+
+    def wheelEvent(self, event):
+        # only spin with wheel when fully focused
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+    def mousePressEvent(self, event):
+        # clicking anywhere lets you edit
+        super().mousePressEvent(event)
+        self.lineEdit().setFocus()
+        self.lineEdit().selectAll()
+
+    def focusInEvent(self, event):
+        # tabbing in also selects all for easy overwrite
+        super().focusInEvent(event)
+        self.lineEdit().setFocus()
+        self.lineEdit().selectAll()
+
+    def keyPressEvent(self, event):
+        # Enter: commit the edit, then hand focus back to the main GUI
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.interpretText()
+            self.lineEdit().clearFocus()
+            win = self.window()
+            if win:
+                # if it's a QMainWindow, focus its central widget
+                if hasattr(win, "centralWidget"):
+                    cw = win.centralWidget()
+                    if cw:
+                        cw.setFocus()
+                    else:
+                        win.setFocus()
+                else:
+                    win.setFocus()
+            return
+        super().keyPressEvent(event)
+
+
+    def focusOutEvent(self, event):
+        # losing focus (click elsewhere) commits text then returns focus
+        self.interpretText()
+        super().focusOutEvent(event)
+        win = self.window()
+        if win:
+            if hasattr(win, "centralWidget"):
+                cw = win.centralWidget()
+                if cw:
+                    cw.setFocus()
+                else:
+                    win.setFocus()
+            else:
+                win.setFocus()
+
+    def eventFilter(self, obj, event):
+        # also commit if the inner QLineEdit loses focus
+        if obj is self.lineEdit() and event.type() == QEvent.FocusOut:
+            self.interpretText()
+        return super().eventFilter(obj, event)
+
+    def valueFromText(self, text: str) -> float:
+        # parse floats robustly
+        try:
+            return float(text)
+        except ValueError:
+            return self.value()
+
+class DriveOptionsDialog(QDialog):
+    def __init__(self, parent, initial_profiles: dict[int, float]):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Drive Velocity Profiles")
+        layout = QVBoxLayout(self)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        self.edits: dict[int, QLineEdit] = {}
+
+        for i in range(1,5):
+            h = QHBoxLayout()
+            h.addWidget(QLabel(f"Velocity {i} (µm/s):"))
+            edit = FocusWheelSpinBox(self)
+            edit.setDecimals(1)
+            # enforce the same global max you’ve chosen for jog fields
+            edit.setRange(   0.0, 2000.0   )
+            edit.setSingleStep(0.1)
+            edit.setValue(initial_profiles.get(i, 0.0))
+            h.addWidget(edit)
+            layout.addLayout(h)
+            self.edits[i] = edit
+
+        btns = QHBoxLayout()
+        btn_apply  = QPushButton("Apply")
+        btn_cancel = QPushButton("Cancel")
+        # disable auto-default so Enter doesn’t trigger these buttons
+        btn_apply .setAutoDefault(False)
+        btn_apply .setDefault(False)
+        btn_cancel.setAutoDefault(False)
+        btn_cancel.setDefault(False)
+        btn_apply.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        btns.addWidget(btn_apply)
+        btns.addWidget(btn_cancel)
+        layout.addLayout(btns)
+
+    def getValues(self) -> dict[int,float]:
+        return {i: float(self.edits[i].text()) for i in self.edits}
+    
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            fw = self.focusWidget()
+            if not isinstance(fw, QLineEdit):
+                self.accept()
+                return
+        super().keyPressEvent(event)
+        
+    def mousePressEvent(self, event):
+        # commit & clear focus on any spin’s editor if you click elsewhere
+        from PyQt5.QtWidgets import QLineEdit
+        fw = self.focusWidget()
+        if isinstance(fw, QLineEdit):
+            parent = fw.parent()
+            if hasattr(parent, 'interpretText'):
+                parent.interpretText()
+                parent.clearFocus()
+        super().mousePressEvent(event)
+        # after clicking anywhere, give focus to the dialog
+        self.setFocus()
+
+    def _on_apply_clicked(self):
+        """Close/apply when a spin-box loses focus."""
+        self.accept()
 
 # ---------------------------------------------------------------------------------
 class MultiAxisGui(QtWidgets.QWidget):
@@ -711,6 +859,22 @@ class MultiAxisGui(QtWidgets.QWidget):
     
         # remember last value shown on screen for each axis
         self.last_displayed = {'X': None, 'Y': None, 'Z': None}
+        
+        self.drive_profiles = {1: 375.0, 2: 750.0, 3: 1125.0, 4: 1500.0}
+        self.drive_selected_profile = 4
+        
+       # Create—but hide until Drive is chosen—these controls:
+        self.combo_DriveProfileZ = QComboBox(self)
+        for i in range(1,5):
+            self.combo_DriveProfileZ.addItem(f"Profile {i}")
+        self.combo_DriveProfileZ.setCurrentIndex(self.drive_selected_profile-1)
+        # keep drive_selected_profile in sync when the user picks a profile
+        self.combo_DriveProfileZ.currentIndexChanged.connect(self._on_profile_change)
+        self.combo_DriveProfileZ.hide()
+    
+        self.btn_EditDriveProfilesZ = QPushButton("Edit Profiles…", self)
+        self.btn_EditDriveProfilesZ.clicked.connect(self._edit_drive_profiles)
+        self.btn_EditDriveProfilesZ.hide()
         
         # Top‐level layout: axis groups stacked vertically
         layout = QtWidgets.QVBoxLayout(self)
@@ -789,6 +953,15 @@ class MultiAxisGui(QtWidgets.QWidget):
         
         # Track when the user actually requested a home, per-axis:
         self._homing_requested = {ax: False for ax in ("X","Y","Z")}
+        self._actual_homing = {ax: False for ax in ("X","Y","Z")}
+        
+        # catch every combo change
+        for combo in self.findChildren(QComboBox):
+            combo.currentIndexChanged.connect(self._defocus_and_refocus)
+            
+        # catch every button click
+        for btn in self.findChildren(QPushButton):
+            btn.clicked.connect(self._defocus_and_refocus)
 
         # Ensure keyPressEvent works:
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
@@ -822,6 +995,55 @@ class MultiAxisGui(QtWidgets.QWidget):
         for w in [label_dev, combo_dev, lbl_status1, status_display]:
             hlay1.addWidget(w)
         hlay1.addStretch(1)
+        
+        lbl_homing = QtWidgets.QLabel("Homing:")                                     
+        cb_homing  = QtWidgets.QCheckBox()                                           
+        cb_homing.setEnabled(False)       
+        lbl_homing.hide()
+        cb_homing.hide()    
+        setattr(self, f"label_Homing{axis_label}", lbl_homing)                                      
+        setattr(self, f"checkbox_Homing{axis_label}", cb_homing)                     
+        
+        lbl_rev   = QtWidgets.QLabel("Rev Limit:")                                  
+        cb_rev    = QtWidgets.QCheckBox()                                            
+        cb_rev.setEnabled(False)
+        lbl_rev.hide()
+        cb_rev.hide()    
+        setattr(self, f"label_RevLimit{axis_label}", lbl_rev)                                                 
+        setattr(self, f"checkbox_RevLimit{axis_label}", cb_rev)                        
+
+        lbl_fwd   = QtWidgets.QLabel("Fwd Limit:")                                  
+        cb_fwd    = QtWidgets.QCheckBox()                                            
+        cb_fwd.setEnabled(False)
+        lbl_fwd.hide()
+        cb_fwd.hide()        
+        setattr(self, f"label_FwdLimit{axis_label}", lbl_fwd)                                             
+        setattr(self, f"checkbox_FwdLimit{axis_label}", cb_fwd)
+        
+        # 1) Make the parent “indicator row” layout (no margins, no spacing):
+        indicator_row = QtWidgets.QHBoxLayout()
+        indicator_row.setContentsMargins(0, 0, 0, 0)
+        indicator_row.setSpacing(0)
+        
+        # helper to pack one label+box pair
+        def add_pair(parent_layout, label, checkbox, inner_gap=4, outer_gap=16):
+            pair = QtWidgets.QHBoxLayout()
+            pair.setContentsMargins(0, 0, 0, 0)
+            pair.setSpacing(inner_gap)            # small gap between label & box
+            pair.addWidget(label)
+            pair.addWidget(checkbox)
+            parent_layout.addLayout(pair)
+            parent_layout.addSpacing(outer_gap)    # gap *after* this pair
+        
+        # 2) Add each pair in the order you like:
+        add_pair(indicator_row, lbl_homing, cb_homing, inner_gap=4, outer_gap=20)
+        add_pair(indicator_row, lbl_rev,     cb_rev,     inner_gap=4, outer_gap=20)
+        add_pair(indicator_row, lbl_fwd,     cb_fwd,     inner_gap=4, outer_gap=0)
+        
+        # 3) Finally stick that indicator_row into the main Row 1 layout:
+        hlay1.addLayout(indicator_row)                                                              
+            
+        hlay1.addStretch(1)
         vlay.addLayout(hlay1)
         
         # Container for everything *below* Row 1
@@ -843,9 +1065,39 @@ class MultiAxisGui(QtWidgets.QWidget):
 
         setattr(self, f"combo_Mode{axis_label}", combo_mode)
 
+        # add Mode dropdown
         hlay2.addWidget(label_mode)
         hlay2.addWidget(combo_mode)
+        if allow_drive:
+            hlay2.addWidget(self.combo_DriveProfileZ)
+            hlay2.addWidget(self.btn_EditDriveProfilesZ)    
+            hlay2.addSpacing(200)
+        else:
+            hlay2.addSpacing(213)
+
+        # now put the 3 jog‐preset buttons into the same HBox
+        btn_slow   = QtWidgets.QPushButton("Slow preset")
+        btn_medium = QtWidgets.QPushButton("Medium preset")
+        btn_fast   = QtWidgets.QPushButton("Fast Preset")
+        for btn in (btn_slow, btn_medium, btn_fast):
+            btn.setFocusPolicy(Qt.NoFocus)
+            # only show in Jog
+            btn.setVisible(combo_mode.currentText() == "Jog")
+            # hide/show on mode change
+            combo_mode.currentTextChanged.connect(
+                lambda m, b=btn: b.setVisible(m == "Jog")
+            )
+            # wire each to the preset helper
+            btn.clicked.connect(
+                lambda _, b=btn, ax=axis_label: 
+                    self._apply_jog_preset(ax,
+                        {"Slow preset":"slow",
+                         "Medium preset":"medium",
+                         "Fast Preset":"fast"}[b.text()]))
+            hlay2.addWidget(btn)
+
         hlay2.addStretch(1)
+        # *only* add this layout once, *after* the buttons:
         ctrl_vlay.addLayout(hlay2)
 
         # --- Row 3: Jog sub-mode (Continuous / Single) — only visible when Mode=Jog ---
@@ -854,21 +1106,24 @@ class MultiAxisGui(QtWidgets.QWidget):
         radio_single = QtWidgets.QRadioButton("Single‐Click")
         radio_cont.setChecked(True)
         label_vel = QtWidgets.QLabel("Velocity (µm/s):")
-        edit_vel = QtWidgets.QLineEdit("1.0")
         label_acc = QtWidgets.QLabel("Acceleration (µm/s²):")
-        edit_acc = QtWidgets.QLineEdit("1.0")
+        # our spin-boxes for arrows + wheel
+        edit_vel  = FocusWheelSpinBox(self)
+        edit_vel.setDecimals(1)
+        edit_vel.setRange(self._min_vel_disp[axis_label], 2000.0)
+        edit_vel.setSingleStep(0.1)
+        edit_vel.setValue(self._min_vel_disp[axis_label])
+ 
+        edit_acc  = FocusWheelSpinBox(self)
+        edit_acc.setDecimals(1)
+        edit_acc.setRange(self._min_acc_disp[axis_label], 2000.0)
+        edit_acc.setSingleStep(0.1)
+        edit_acc.setValue(self._min_acc_disp[axis_label])
 
         setattr(self, f"radio_Cont{axis_label}", radio_cont)
         setattr(self, f"radio_Single{axis_label}", radio_single)
         setattr(self, f"edit_Velocity{axis_label}", edit_vel)
         setattr(self, f"edit_Accel{axis_label}", edit_acc)
-        
-        # create a shared double-validator
-        double_validator = QDoubleValidator(self)
-        double_validator.setNotation(QDoubleValidator.StandardNotation)
-        double_validator.setDecimals(6)  # up to six decimal places 
-        edit_vel.setValidator(double_validator)
-        edit_acc.setValidator(double_validator)
         
         # Whenever they toggle sub-mode, show/hide the “By” container accordingly:
         radio_single.toggled.connect(lambda checked, ax=axis_label: getattr(self, f"container_By{ax}").setVisible(checked))
@@ -893,15 +1148,19 @@ class MultiAxisGui(QtWidgets.QWidget):
         label_pos = QtWidgets.QLabel(f"{axis_label} Position:")
         edit_pos = QtWidgets.QLineEdit("0.000")
         edit_pos.setAlignment(QtCore.Qt.AlignRight)
-        btn_move_neg = QtWidgets.QPushButton("<")
-        btn_move_pos = QtWidgets.QPushButton(">")
+        btn_move_neg = QtWidgets.QPushButton("< -")
+        btn_move_pos = QtWidgets.QPushButton("+ >")
         btn_move_neg.setFocusPolicy(QtCore.Qt.NoFocus)
         btn_move_pos.setFocusPolicy(QtCore.Qt.NoFocus)
         label_by = QtWidgets.QLabel("By:")  # we'll set text and show/hide later
-        edit_step = QtWidgets.QLineEdit(str(iface.settings['step_size']*MM_TO_UM))
         btn_home = QtWidgets.QPushButton(f"Home {axis_label}")
         btn_stop = QtWidgets.QPushButton(f"Stop {axis_label}")
         btn_stop.setEnabled(False)
+        edit_step = FocusWheelSpinBox(self)
+        edit_step.setDecimals(1)
+        edit_step.setRange(0.0, 5000)
+        edit_step.setSingleStep(0.1)
+        edit_step.setValue(iface.settings['step_size'] * MM_TO_UM)
 
         setattr(self, f"edit_Position{axis_label}", edit_pos)
         setattr(self, f"button_MovePos{axis_label}", btn_move_pos)
@@ -914,12 +1173,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         pos_validator.setNotation(QDoubleValidator.StandardNotation)
         pos_validator.setDecimals(3)
         edit_pos.setValidator(pos_validator)
-
-        # Step-size “By:” (µm) – 6 decimal places
-        step_validator = QDoubleValidator(self)
-        step_validator.setNotation(QDoubleValidator.StandardNotation)
-        step_validator.setDecimals(6)
-        edit_step.setValidator(step_validator)
 
         # We’ll add label_pos, edit_pos, btn_move_neg, btn_move_pos first:
         for w in [label_pos, edit_pos, btn_move_neg, btn_move_pos]:
@@ -941,41 +1194,15 @@ class MultiAxisGui(QtWidgets.QWidget):
         hlay4.addStretch(1)
         ctrl_vlay.addLayout(hlay4)
         
-        # ---- Row 5: Limit-switch indicators ---------
-        hlay5 = QtWidgets.QHBoxLayout()
-        lbl_rev = QtWidgets.QLabel("Rev Limit:")
-        cb_rev = QtWidgets.QCheckBox()
-        cb_rev.setEnabled(False)
-        setattr(self, f"checkbox_RevLimit{axis_label}", cb_rev)
-        hlay5.addWidget(lbl_rev)
-        hlay5.addWidget(cb_rev)
- 
-        lbl_fwd = QtWidgets.QLabel("Fwd Limit:")
-        cb_fwd = QtWidgets.QCheckBox()
-        cb_fwd.setEnabled(False)
-        setattr(self, f"checkbox_FwdLimit{axis_label}", cb_fwd)
-        hlay5.addWidget(lbl_fwd)
-        hlay5.addWidget(cb_fwd)
- 
-        ctrl_vlay.addLayout(hlay5)
-        
-        # ---- Row 6: Homing indicator & Status display ---
-        hlay6 = QtWidgets.QHBoxLayout()
-    
-        lbl_homing = QtWidgets.QLabel("Homing:")
-        cb_homing = QtWidgets.QCheckBox()
-        cb_homing.setEnabled(False)
-        setattr(self, f"checkbox_Homing{axis_label}", cb_homing)
-        hlay6.addWidget(lbl_homing)
-        hlay6.addWidget(cb_homing)
-    
-        # Reset motor button shares this row now:
+        # ---- Row 5 & 6 removed: those controls now live in Row 1 ----
+        # (leave only the Reset button in its own row if you like)
+        hlay_reset = QtWidgets.QHBoxLayout()
         btn_reset = QtWidgets.QPushButton("Reset motor")
         btn_reset.setFocusPolicy(QtCore.Qt.NoFocus)
         setattr(self, f"button_ResetHome{axis_label}", btn_reset)
         btn_reset.clicked.connect(lambda _, ax=axis_label: self._on_reset_homing(ax))
-        hlay6.addWidget(btn_reset)
-        ctrl_vlay.addLayout(hlay6)
+        hlay_reset.addWidget(btn_reset)
+        ctrl_vlay.addLayout(hlay_reset)
 
         # --- Connect signals & slots for this axis ---
         iface.sig_list_devices_updated.connect(lambda lst, ax=axis_label: self._on_list_devices_updated(ax, lst))
@@ -983,6 +1210,7 @@ class MultiAxisGui(QtWidgets.QWidget):
         iface.sig_update_position.connect(lambda val, ax=axis_label: self._on_position_change(ax, val))
         iface.sig_step_size.connect(lambda val, ax=axis_label: self._on_step_size_change(ax, val))
         iface.sig_stage_info.connect(lambda info, ax=axis_label: self._on_stage_info_change(ax, info))
+        iface.sig_change_homing_status.connect(lambda stat, ax=axis_label: self._on_homing_state_change(ax, stat))
 
         # --- Wire up the buttons and mode changes ---
         # btn_connect.clicked.connect(lambda _, ax=axis_label: self._connect_clicked(ax))
@@ -995,18 +1223,12 @@ class MultiAxisGui(QtWidgets.QWidget):
         btn_move_neg.released.connect(lambda ax=axis_label: self._arrow_released(ax, -1))
         btn_move_pos.released.connect(lambda ax=axis_label: self._arrow_released(ax, +1))
 
-        edit_step.returnPressed.connect(lambda ax=axis_label: self._press_enter_step(ax))
-        edit_vel.returnPressed.connect(lambda ax=axis_label: self._press_enter_velocity(ax))
-        edit_acc.returnPressed.connect(lambda ax=axis_label: self._press_enter_accel(ax))
         
         edit_pos.returnPressed.connect(lambda ax=axis_label: self._move_to_position(ax))
         edit_pos.returnPressed.disconnect()
         edit_pos.editingFinished.connect(lambda ax=axis_label: self._move_to_position(ax))
-        edit_step.returnPressed.disconnect()
         edit_step.editingFinished.connect(lambda ax=axis_label: self._press_enter_step(ax))
-        edit_vel.returnPressed.disconnect()
         edit_vel.editingFinished.connect(lambda ax=axis_label: self._press_enter_velocity(ax))
-        edit_acc.returnPressed.disconnect()
         edit_acc.editingFinished.connect(lambda ax=axis_label: self._press_enter_accel(ax))
         
         btn_home.clicked.connect(lambda _, ax=axis_label: self._home_clicked(ax))
@@ -1017,6 +1239,10 @@ class MultiAxisGui(QtWidgets.QWidget):
         btn_home          .setFocusPolicy(QtCore.Qt.NoFocus)
         btn_stop          .setFocusPolicy(QtCore.Qt.NoFocus)
         btn_reset    .setFocusPolicy(QtCore.Qt.NoFocus)
+        
+        # Install an event filter on every spin‐box
+        for sb in self.findChildren(QAbstractSpinBox):
+            sb.installEventFilter(self)
 
         # Initially hide/show the Jog options row...
         if combo_mode.currentText() == "Drive":
@@ -1028,7 +1254,7 @@ class MultiAxisGui(QtWidgets.QWidget):
         placeholder = QtWidgets.QWidget()
         stack = QStackedWidget()
         stack.addWidget(placeholder)     # index 0: empty placeholder
-        stack.addWidget(container)       # index 1: your real controls
+        stack.addWidget(container)       # index 1: the real controls
         stack.setCurrentIndex(0)         # start by showing the placeholder
         stack.setSizePolicy(QSizePolicy.Preferred,
                             QSizePolicy.Preferred)
@@ -1072,7 +1298,7 @@ class MultiAxisGui(QtWidgets.QWidget):
     
     @QtCore.pyqtSlot(str, float, float)
     def _on_limits_update(self, axis: str, mn: float, mx: float):
-        # piggy-back on your existing stage-info handler
+        # piggy-back on the existing stage-info handler
         self._on_stage_info_change(axis, [mn, mx, None, None])
 
     def _on_list_devices_updated(self, axis: str, lst: list):
@@ -1096,12 +1322,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         # btn_connect = getattr(self, f"button_Connect{axis}")
         status_lbl = getattr(self, f"label_Status{axis}")
 
-        # toggle Connect ↔ Disconnect text
-        # if connected:
-        #     btn_connect.setText(f"Disconnect {axis}")
-        # else:
-        #     btn_connect.setText(f"Connect {axis}")
-
         stack = getattr(self, f"stack_Controls{axis}", None)
         if stack is not None:
             stack.setCurrentIndex(1 if connected else 0)
@@ -1114,6 +1334,67 @@ class MultiAxisGui(QtWidgets.QWidget):
             
         # now update our “Go to Preset” button
         self._update_preset_button_state()
+        
+        for name in ("RevLimit", "FwdLimit", "Homing"):
+            lbl_attr = f"label_{name}{axis}"
+            cb_attr  = f"checkbox_{name}{axis}"
+    
+            lbl = getattr(self, lbl_attr, None)
+            cb  = getattr(self, cb_attr,  None)
+    
+            if lbl is None:
+                print(f"Missing widget: {lbl_attr}")
+            else:
+                lbl.setVisible(connected)
+    
+            if cb is None:
+                print(f"Missing widget: {cb_attr}")
+            else:
+                cb.setVisible(connected)
+    
+    def _on_homing_state_change(self, axis: str, status: int):
+        # 1 = started, 2 = ended
+        self._actual_homing[axis] = (status == interface.SIG_HOMING_STARTED)
+    
+        # as soon as homing ends (or is aborted), clear the UI
+        if status == interface.SIG_HOMING_ENDED:
+            cb = getattr(self, f"checkbox_Homing{axis}", None)
+            lbl = getattr(self, f"label_Status{axis}",    None)
+            if cb:  cb.setChecked(False)
+            if lbl: lbl.setText("Idle")
+        
+    def _on_profile_change(self, idx):
+        """User picked a new drive profile: update and refocus."""
+        self.drive_selected_profile = idx + 1
+        # clear focus from the dropdown itself
+        self.combo_DriveProfileZ.clearFocus()
+        # return focus to the main window
+        self.setFocus()
+        
+    def eventFilter(self, obj, ev):
+        # if it's a spin-box and a key press...
+        from PyQt5.QtWidgets import QAbstractSpinBox
+        if isinstance(obj, QAbstractSpinBox) and ev.type() == QEvent.KeyPress:
+            key = ev.key()
+            # only intercept arrow keys, page up/down, and space
+            if key in (
+                Qt.Key_Left, Qt.Key_Right,
+                Qt.Key_Up,   Qt.Key_Down,
+                Qt.Key_PageUp, Qt.Key_PageDown,
+                Qt.Key_Space
+            ):
+                # forward to the jog/stop handler
+                self.keyPressEvent(ev)
+                return True    # don’t let the spin-box eat it
+        # everything else: let Qt handle normally
+        return super().eventFilter(obj, ev)
+
+    def _defocus_and_refocus(self):
+        """Clear focus from whatever sent this, then focus the main window."""
+        w = self.sender()
+        if hasattr(w, 'clearFocus'):
+            w.clearFocus()
+        self.setFocus()
 
     def _update_preset_button_state(self):
         """Enable Go to Preset only when both X and Y are connected."""
@@ -1129,9 +1410,14 @@ class MultiAxisGui(QtWidgets.QWidget):
             edit.setText(f"{val_disp:.3f}")
 
     def _on_step_size_change(self, axis: str, val_mm: float):
-        edit: QtWidgets.QLineEdit = getattr(self, f"edit_StepSize{axis}")
+        edit = getattr(self, f"edit_StepSize{axis}")
         val_disp = val_mm * MM_TO_UM
-        edit.setText(f"{val_disp:.3f}")
+        # if this widget is a spin-box, update via setValue
+        if hasattr(edit, "setValue"):
+            edit.setValue(val_disp)
+        else:
+            # fallback for any QLineEdit you left in place
+            edit.setText(f"{val_disp:.3f}")
             
     @QtCore.pyqtSlot(str, bool, bool)
     def _on_hardware_status_update(self, axis: str, in_motion: bool, homed: bool):
@@ -1141,30 +1427,33 @@ class MultiAxisGui(QtWidgets.QWidget):
             if lbl_status:
                 lbl_status.setText("Not connected")
             return
-        cb_homing  = getattr(self, f"checkbox_Homing{axis}", None)
-        btn_stop   = getattr(self, f"button_Stop{axis}",    None)
-        now = time.time()
     
-        # 1) If the motor begins moving, start polling its position:
-        if in_motion:
+        cb_homing = getattr(self, f"checkbox_Homing{axis}", None)
+        btn_stop  = getattr(self, f"button_Stop{axis}",    None)
+    
+        # keep polling while moving *or* homing, so you always get live updates
+        if in_motion or self._actual_homing[axis]:
             self.poller.start_poll(axis)
+        else:
+            self.poller.stop_poll(axis)
     
-        # 2) Update Homing checkbox & Status label as before:
-        # only treat as actual homing if the user requested it
-        # any in_motion after a Home click is “Homing”
-        is_homing = in_motion and self._homing_requested.get(axis, False)
-        # any other in_motion is a normal move
+        # only clear the homing-flag on a *completed* home (homed=True)
+        if self._actual_homing[axis] and homed:
+            self._actual_homing[axis] = False
+    
+        # determine what to show
+        is_homing = self._actual_homing[axis]
         is_moving = in_motion and not is_homing
     
-        if cb_homing:     cb_homing.setChecked(is_homing)
+        # update UI
+        if cb_homing:
+            cb_homing.setChecked(is_homing)
         if lbl_status:
             lbl_status.setText(
                 "Homing" if is_homing else
                 "Moving" if is_moving else
                 "Idle"
             )
-    
-        # 3) Enable Stop button for any motion:
         if btn_stop:
             btn_stop.setEnabled(in_motion)
 
@@ -1223,7 +1512,7 @@ class MultiAxisGui(QtWidgets.QWidget):
                 iface.disconnect_device()
                 # clear the stored name so poller/gates skip this axis
                 iface.connected_device_name = ""
-                # update your status label (replace with your widget’s name)
+                # update the status label (replace with the widget’s name)
                 getattr(self, f"label_Status{axis}").setText("Not connected")
     
                 # purge any stale _serial_number so our guard fails
@@ -1241,18 +1530,33 @@ class MultiAxisGui(QtWidgets.QWidget):
 
     def _on_mode_changed(self, axis: str, new_mode: str):
         """
-        Called when the Mode combo changes (Jog <-> Drive).
-        If new_mode == "Drive", hide the Jog sub-mode row; else show it.
-        Also stop any active position-poll timers for this axis.
+        Show/hide jog controls vs. drive-profile selector for Z.
         """
-        widget_row3: QtWidgets.QWidget = getattr(self, f"widget_JogOptions{axis}")
-        # Show or hide the jog options row
-        if new_mode == "Drive":
+        widget_row3 = getattr(self, f"widget_JogOptions{axis}")
+        if axis == "Z" and new_mode == "Drive":
             widget_row3.hide()
-            # stop live‐polling this axis
-            self.poller.stop_poll(axis)
+            self.combo_DriveProfileZ.show()
+            self.btn_EditDriveProfilesZ.show()
         else:
             widget_row3.show()
+            if axis == "Z":
+                self.combo_DriveProfileZ.hide()
+                self.btn_EditDriveProfilesZ.hide()
+                
+    def _apply_jog_preset(self, axis: str, which: str):
+        """
+        Fill the Velocity and Acceleration spinboxes with one of three presets.
+        """
+        # per-axis presets (all in µm/s and µm/s²)
+        mapping = {
+            'X': {'slow': 1.0,   'medium': 5.0,  'fast': 10.0},
+            'Y': {'slow': 1.0,   'medium': 5.0,  'fast': 10.0},
+            'Z': {'slow': 0.1,   'medium': 2.0,  'fast': 10.0},
+        }
+        val = mapping[axis][which]
+        # update the two FocusWheelSpinBox widgets
+        getattr(self, f"edit_Velocity{axis}").setValue(val)
+        getattr(self, f"edit_Accel{axis}"   ).setValue(val)
 
     def _press_enter_position(self, axis: str):
         """
@@ -1350,7 +1654,32 @@ class MultiAxisGui(QtWidgets.QWidget):
 
     def _stop_clicked(self, axis: str):
         iface: interface = getattr(self, f"iface_{axis}")
-        iface.stop_any_movement()
+        try:
+            # read back whatever max-vel is currently set
+            threshold_mm_s = 100.0 * UM_TO_MM
+            vel, acc = self._read_jog_params(axis)
+
+            if vel > threshold_mm_s:
+                # above threshold : smooth, profiled stop
+                iface.instrument.stop_profiled()
+                self._actual_homing[axis] = False
+                cb = getattr(self, f"checkbox_Homing{axis}", None)
+                lbl = getattr(self, f"label_Status{axis}",    None)
+                if cb:  cb.setChecked(False)
+                if lbl: lbl.setText("Idle")
+            else:
+                # below threshold : zero-vel “sudden” stop
+                # (set max_vel = 0 so motor brakes instantly)
+                iface.set_velocity_profile(0.0, acc)
+                iface.move_velocity_continuous(1)
+                iface.instrument.stop_profiled()
+                self._actual_homing[axis] = False
+                cb = getattr(self, f"checkbox_Homing{axis}", None)
+                lbl = getattr(self, f"label_Status{axis}",    None)
+                if cb:  cb.setChecked(False)
+                if lbl: lbl.setText("Idle")
+        except Exception as e:
+            print(f"[ERROR] stop failed for {axis} motor: {e}")
         
     def _stop_all(self):
         """Stop any motion on X, Y, and Z immediately."""
@@ -1367,18 +1696,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         vel_field = getattr(self, f"edit_Velocity{axis}")
         acc_field = getattr(self, f"edit_Accel{axis}")
     
-        # 1) Make sure the current text is acceptable to the validator
-        for field, name in ((vel_field, "velocity"), (acc_field, "acceleration")):
-            if not field.hasAcceptableInput():
-                QtWidgets.QMessageBox.warning(
-                    self, "Invalid characters",
-                    f"{axis}-axis: please enter only digits and at most one decimal point for {name}."
-                )
-                field.selectAll()
-                field.setFocus()
-                return None
-    
-        # 2) Now parse and clamp as before…
         try:
             disp_vel = float(vel_field.text())
         except ValueError:
@@ -1389,15 +1706,6 @@ class MultiAxisGui(QtWidgets.QWidget):
             )
             vel_field.selectAll(); vel_field.setFocus()
             return None
-    
-        if disp_vel < self._min_vel_disp[axis]:
-            QtWidgets.QMessageBox.warning(
-                self, "Value too small",
-                f"{axis}-axis minimum velocity is {self._min_vel_disp[axis]} µm/s.\n"
-                "Using this minimum value instead."
-            )
-            vel_field.setText(f"{self._min_vel_disp[axis]:.1f}")
-            disp_vel = self._min_vel_disp[axis]
     
         vel_mm_s = disp_vel * UM_TO_MM
     
@@ -1410,15 +1718,6 @@ class MultiAxisGui(QtWidgets.QWidget):
             )
             acc_field.selectAll(); acc_field.setFocus()
             return None
-    
-        if disp_acc < self._min_acc_disp[axis]:
-            QtWidgets.QMessageBox.warning(
-                self, "Value too small",
-                f"{axis}-axis minimum acceleration is {self._min_acc_disp[axis]} µm/s².\n"
-                "Using this minimum value instead."
-            )
-            acc_field.setText(f"{self._min_acc_disp[axis]:.1f}")
-            disp_acc = self._min_acc_disp[axis]
     
         acc_mm_s2 = disp_acc * UM_TO_MM
     
@@ -1433,6 +1732,26 @@ class MultiAxisGui(QtWidgets.QWidget):
         vel, acc = self._read_jog_params(axis)
         iface.set_velocity_profile(vel, acc)
         iface.move_velocity_continuous(direction)
+        
+    def _start_drive(self, axis: str, direction: int):
+        iface = getattr(self, f"iface_{axis}")
+        # look up µm/s → mm/s
+        vel_um = self.drive_profiles.get(self.drive_selected_profile, 0.0)
+        acc_um = 1000.0
+        vel_mm_s  = vel_um * UM_TO_MM
+        acc_mm_s2 = acc_um * UM_TO_MM
+
+        iface.set_velocity_profile(vel_mm_s, acc_mm_s2)
+        iface.move_velocity_continuous(direction)
+        
+    def _edit_drive_profiles(self):
+        dlg = DriveOptionsDialog(
+            self,
+            initial_profiles=self.drive_profiles
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            # dialog now only returns the 4-profile dict
+            self.drive_profiles = dlg.getValues()
             
     def _apply_preset_dict(self, data: dict, show_message: bool=True):
         # 1) Extract—and treat data['x'],['y'] as µm:
@@ -1529,7 +1848,7 @@ class MultiAxisGui(QtWidgets.QWidget):
 
         # --- Drive Mode (Z axis continuous) ---
         if mode == "Drive" and axis == "Z":
-            self._start_continuous(axis, direction)
+            self._start_drive(axis, direction)
             return
 
     def _arrow_released(self, axis: str, direction: int):
@@ -1552,26 +1871,30 @@ class MultiAxisGui(QtWidgets.QWidget):
         
         # Gracefully decelerate the motor if it was in “move_velocity” mode:
         iface: interface = getattr(self, f"iface_{axis}")
-        if iface.connected_device_name:
+        if getattr(self, f"radio_Cont{axis}").isChecked() and iface.connected_device_name:
+                try:
+                    # read back whatever max-vel is currently set
+                    threshold_mm_s = 100.0 * UM_TO_MM
+                    vel, acc = self._read_jog_params(axis)
+        
+                    if vel > threshold_mm_s:
+                        # above threshold : smooth, profiled stop
+                        iface.instrument.stop_profiled()
+                    else:
+                        # below threshold : zero-vel “sudden” stop
+                        # (set max_vel = 0 so motor brakes instantly)
+                        iface.set_velocity_profile(0.0, acc)
+                        iface.move_velocity_continuous(direction)
+                        iface.instrument.stop_profiled()
+                except Exception as e:
+                    print(f"[ERROR] stop failed for {axis} motor: {e}")
+                    
+        if mode == "Drive":
             try:
-                # read back whatever max-vel is currently set
-                threshold_mm_s = 100.0 * UM_TO_MM
-                vel, acc = self._read_jog_params(axis)
-    
-                if vel > threshold_mm_s:
-                    # above threshold : smooth, profiled stop
-                    iface.instrument.stop_profiled()
-                else:
-                    # below threshold : zero-vel “sudden” stop
-                    # (set max_vel = 0 so motor brakes instantly)
-                    iface.set_velocity_profile(0.0, acc)
-                    iface.move_velocity_continuous(direction)
-                    iface.instrument.stop_profiled()
-            except Exception as e:
-                print(f"[ERROR] stop failed for {axis} motor: {e}")
-
-            # now catch *all* overshoot by polling position stability
-        self._poll_until_settled(axis)
+                iface.instrument.stop_profiled()
+            except:
+                pass
+            return
 
     def keyPressEvent(self, event: QtGui.QKeyEvent):
         """
@@ -1582,7 +1905,7 @@ class MultiAxisGui(QtWidgets.QWidget):
 
         #  X-axis: A / D 
         if key in (QtCore.Qt.Key_A, QtCore.Qt.Key_D) and not event.isAutoRepeat():
-            direction = -1 if key == QtCore.Qt.Key_A else +1
+            direction = 1 if key == QtCore.Qt.Key_A else -1
             self._arrow_pressed("X", direction)
             return
 
@@ -1616,6 +1939,10 @@ class MultiAxisGui(QtWidgets.QWidget):
                 iface.stop_any_movement()
                 self._poll_until_settled(ax)
             return
+        
+        if event.key() == QtCore.Qt.Key_Shift and not event.isAutoRepeat():
+            for axis in ("X", "Y", "Z"):
+                self._on_reset_homing(axis)
         super().keyPressEvent(event)
         
     def keyReleaseEvent(self, event: QtGui.QKeyEvent):
@@ -1685,7 +2012,7 @@ class MultiAxisGui(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("pyThorlabsAPT – 3-Axis")
+        self.setWindowTitle("pyStack – 3-Axis Multi-Motor GUI")
 
     def closeEvent(self, event):
         # Emergency stop all motors on GUI close
@@ -1714,7 +2041,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     print(f"[DEBUG] {time.strftime('%H:%M:%S')}  :  In main(), before anything else.")
-    parser = argparse.ArgumentParser(description="pyThorlabsAPT – 3-Axis multi-motor GUI")
+    parser = argparse.ArgumentParser(description="pyStack – 3-Axis multi-motor GUI")
     parser.add_argument("-s", "--decrease_verbose", action="store_true", help="Decrease verbosity")
     parser.add_argument("-virtual", action="store_true", help="Use virtual driver (no hardware).")
     args = parser.parse_args()
@@ -1730,9 +2057,10 @@ def main():
     window = MainWindow()
     gui3 = MultiAxisGui(iface_x, iface_y, iface_z, parent=window)
     window.setCentralWidget(gui3)
-    window.resize(700, 500)
+    window.resize(760, 900)
 
     print(f"[DEBUG] {time.strftime('%H:%M:%S')}  :  About to call window.show() and app.exec_().")
+    window.setMinimumWidth(window.width())
     window.show()
 
     # Ensure interfaces close when the app is quitting:
@@ -1750,7 +2078,7 @@ if __name__ == "__main__":
         main()
     except Exception:
         print("")
-        print(" ERROR: Unhandled exception in pyThorlabsAPT.main()")
+        print(" ERROR: Unhandled exception in pyStack.main()")
         print("")
         traceback.print_exc()
         print("")
@@ -1758,5 +2086,3 @@ if __name__ == "__main__":
 
 # Alias for the console entrypoint:
 gui = MultiAxisGui
-
-# 
