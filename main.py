@@ -1,7 +1,14 @@
 import traceback, sys, logging, faulthandler
 import os, json, time, argparse, atexit, PyQt5, threading
-import pyThorlabsAPT.driver as driver_real
+try:
+    import pyThorlabsAPT.driver as driver_real
+except Exception as e:
+    print(f"[ERROR] Failed to import driver: {e}. Please open the Thorlabs Kinesis software, briefly connect the motors, then disconnect before reattempting a launch of pyStack.")
+    traceback.print_exc()
+    input("Press Enter to exit…")
+    sys.exit(1) 
 import pyThorlabsAPT.driver_virtual as driver_virtual
+from pathlib import Path
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtCore import Qt, QEvent
 from PyQt5.QtGui import QDoubleValidator
@@ -21,13 +28,29 @@ dirname = os.path.dirname(PyQt5.__file__)
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(dirname, 'plugins', 'platforms')
 faulthandler.enable(all_threads=True)
 atexit.register(apt_core._cleanup)
-# — optionally configure logging to a file or console:
+log_path = r"C:\Users\devar\Documents\pyStack_log-file.log"
 logging.basicConfig(
-    level=logging.ERROR,
-    format='%(asctime)s [%(levelname)s] %(message)s'
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    filename=log_path,
+    filemode="a"    # append across sessions
 )
+# Create (or reuse) a named logger for pyStack
+session_logger = logging.getLogger("pyStack")
+session_logger.setLevel(logging.INFO)
 
-# 
+# Only add FileHandler once
+if not any(isinstance(h, logging.FileHandler) for h in session_logger.handlers):
+    log_path = Path.home() / "pyStack.log"   # or another path of your choice
+    fh = logging.FileHandler(log_path, mode="a")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    session_logger.addHandler(fh)
+
+# Mark the start of a new session
+session_logger.info("""
+=============== New pyStack session started ===============
+""")
+
 # Catch any exception inside Qt callbacks & print it to console
 def exception_hook(exctype, value, tb):
     # log full traceback
@@ -596,7 +619,7 @@ class ConnectDevicesDialog(QDialog):
                 idx = combo.findText(want)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
-                # this calls iface.connect_device() under the hood :contentReference[oaicite:1]{index=1}
+                # this calls iface.connect_device() under the hood
                 self.gui._connect_clicked(axis)
 
             # 2) Disconnect if they unchecked it but it’s currently up
@@ -826,8 +849,8 @@ class MultiAxisGui(QtWidgets.QWidget):
         }
 
         # Minimum allowed velocity (µm/s) and acceleration (µm/s²) by axis:
-        self._min_vel_disp = {'X': 1.0, 'Y': 1.0, 'Z': 0.1}
-        self._min_acc_disp = {'X': 1.0, 'Y': 1.0, 'Z': 0.1}
+        self._min_vel_disp = {'X': 1.0, 'Y': 1.0, 'Z': 0.01}
+        self._min_acc_disp = {'X': 1.0, 'Y': 1.0, 'Z': 0.01}
 
         self.iface_x = iface_x
         self.iface_y = iface_y
@@ -861,7 +884,7 @@ class MultiAxisGui(QtWidgets.QWidget):
         self.last_displayed = {'X': None, 'Y': None, 'Z': None}
         
         self.drive_profiles = {1: 375.0, 2: 750.0, 3: 1125.0, 4: 1500.0}
-        self.drive_selected_profile = 4
+        self.drive_selected_profile = 1
         
        # Create—but hide until Drive is chosen—these controls:
         self.combo_DriveProfileZ = QComboBox(self)
@@ -870,6 +893,12 @@ class MultiAxisGui(QtWidgets.QWidget):
         self.combo_DriveProfileZ.setCurrentIndex(self.drive_selected_profile-1)
         # keep drive_selected_profile in sync when the user picks a profile
         self.combo_DriveProfileZ.currentIndexChanged.connect(self._on_profile_change)
+        self.combo_DriveProfileZ.currentIndexChanged.connect(
+            lambda idx: self.logger.info(
+                f"Z-axis drive profile changed to Profile {idx+1}: "
+                f"{self.drive_profiles[idx+1]:.1f} µm/s"
+            )
+        )
         self.combo_DriveProfileZ.hide()
     
         self.btn_EditDriveProfilesZ = QPushButton("Edit Profiles…", self)
@@ -939,21 +968,16 @@ class MultiAxisGui(QtWidgets.QWidget):
             except Exception:
                 # leave status as “None” on parse error
                 pass
-
-        # Tooltip for keyboard shortcuts:
-        tips = (
-            "Keyboard Shortcuts:\n"
-            "  A / D  : Move X left / right  (or hold for continuous)\n"
-            "  W / S  : Move Y forward / back  (or hold for continuous)\n"
-            "  ↑ / ↓  : Move Z up / down  (or hold for continuous)\n"
-            "  H / J / K : Home X / Home Y / Home Z\n"
-            "  Space : Stop ALL motors\n"
-        )
-        self.setToolTip(tips)
         
         # Track when the user actually requested a home, per-axis:
         self._homing_requested = {ax: False for ax in ("X","Y","Z")}
         self._actual_homing = {ax: False for ax in ("X","Y","Z")}
+        
+        reset_sc = QtWidgets.QShortcut(
+            QtGui.QKeySequence("Shift+Space"),  # the key combo
+            self                                 # parent widget
+        )
+        reset_sc.activated.connect(self._reset_all_motors)
         
         # catch every combo change
         for combo in self.findChildren(QComboBox):
@@ -1062,6 +1086,9 @@ class MultiAxisGui(QtWidgets.QWidget):
         else:
             combo_mode.addItems(["Jog"])
         combo_mode.setCurrentText("Jog")
+        combo_mode.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        combo_mode.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        combo_mode.setMaximumWidth(combo_mode.sizeHint().width())
 
         setattr(self, f"combo_Mode{axis_label}", combo_mode)
 
@@ -1074,6 +1101,7 @@ class MultiAxisGui(QtWidgets.QWidget):
             hlay2.addSpacing(200)
         else:
             hlay2.addSpacing(213)
+        
 
         # now put the 3 jog‐preset buttons into the same HBox
         btn_slow   = QtWidgets.QPushButton("Slow preset")
@@ -1097,6 +1125,10 @@ class MultiAxisGui(QtWidgets.QWidget):
             hlay2.addWidget(btn)
 
         hlay2.addStretch(1)
+        # — log mode changes —
+        combo_mode.currentTextChanged.connect(
+            lambda text, ax=axis_label: self.logger.info(f"{ax}-axis mode set to {text}")
+        )
         # *only* add this layout once, *after* the buttons:
         ctrl_vlay.addLayout(hlay2)
 
@@ -1109,13 +1141,13 @@ class MultiAxisGui(QtWidgets.QWidget):
         label_acc = QtWidgets.QLabel("Acceleration (µm/s²):")
         # our spin-boxes for arrows + wheel
         edit_vel  = FocusWheelSpinBox(self)
-        edit_vel.setDecimals(1)
+        edit_vel.setDecimals(2)
         edit_vel.setRange(self._min_vel_disp[axis_label], 2000.0)
         edit_vel.setSingleStep(0.1)
         edit_vel.setValue(self._min_vel_disp[axis_label])
  
         edit_acc  = FocusWheelSpinBox(self)
-        edit_acc.setDecimals(1)
+        edit_acc.setDecimals(2)
         edit_acc.setRange(self._min_acc_disp[axis_label], 2000.0)
         edit_acc.setSingleStep(0.1)
         edit_acc.setValue(self._min_acc_disp[axis_label])
@@ -1125,9 +1157,44 @@ class MultiAxisGui(QtWidgets.QWidget):
         setattr(self, f"edit_Velocity{axis_label}", edit_vel)
         setattr(self, f"edit_Accel{axis_label}", edit_acc)
         
+        if not hasattr(self, "_single_flash_timers"):
+            self._single_flash_timers = {}
+        
+        # create a QTimer for this axis
+        flash_timer = QtCore.QTimer(self)
+        flash_timer.setInterval(500)  # blink every 500 ms
+        flash_timer._flash_on = False
+        
+        def _toggle_flash(ax=axis_label, timer=flash_timer):
+            timer._flash_on = not timer._flash_on
+            style = "background-color: yellow; color: black" if timer._flash_on else ""
+            getattr(self, f"radio_Single{ax}").setStyleSheet(style)
+        
+        flash_timer.timeout.connect(_toggle_flash)
+        self._single_flash_timers[axis_label] = flash_timer
+        
+        # start/stop flashing whenever the radio is toggled
+        radio_single.toggled.connect(
+            lambda checked, ax=axis_label: (
+                self._single_flash_timers[ax].start() if checked else (
+                    self._single_flash_timers[ax].stop(),
+                    getattr(self, f"radio_Single{ax}").setStyleSheet("")
+                )
+            )
+        )
+        
         # Whenever they toggle sub-mode, show/hide the “By” container accordingly:
         radio_single.toggled.connect(lambda checked, ax=axis_label: getattr(self, f"container_By{ax}").setVisible(checked))
         radio_cont.toggled.connect(lambda checked, ax=axis_label: getattr(self, f"container_By{ax}").setVisible(False))
+        # log jog sub-mode changes
+        radio_cont.toggled.connect(
+            lambda checked, ax=axis_label: 
+                checked and self.logger.info(f"{ax}-axis jog submode set to Continuous")
+        )
+        radio_single.toggled.connect(
+            lambda checked, ax=axis_label: 
+                checked and self.logger.info(f"{ax}-axis jog submode set to Single-Click")
+        )
 
         for w in [radio_cont, radio_single, label_vel, edit_vel, label_acc, edit_acc]:
             hlay3.addWidget(w)
@@ -1156,6 +1223,7 @@ class MultiAxisGui(QtWidgets.QWidget):
         btn_home = QtWidgets.QPushButton(f"Home {axis_label}")
         btn_stop = QtWidgets.QPushButton(f"Stop {axis_label}")
         btn_stop.setEnabled(False)
+        btn_stop.setStyleSheet("background-color: red; color: white;")
         edit_step = FocusWheelSpinBox(self)
         edit_step.setDecimals(1)
         edit_step.setRange(0.0, 5000)
@@ -1175,8 +1243,13 @@ class MultiAxisGui(QtWidgets.QWidget):
         edit_pos.setValidator(pos_validator)
 
         # We’ll add label_pos, edit_pos, btn_move_neg, btn_move_pos first:
-        for w in [label_pos, edit_pos, btn_move_neg, btn_move_pos]:
+        for w in [label_pos, edit_pos]:
             hlay4.addWidget(w)
+
+        # add the four action buttons with stretch=1 so they expand equally
+        for w in [btn_move_neg, btn_move_pos, btn_home, btn_stop]:
+            w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            hlay4.addWidget(w, 1)
 
         # Create a sub-widget for “By (unit): [step]” so we can show/hide it
         container_by = QtWidgets.QWidget()
@@ -1188,10 +1261,6 @@ class MultiAxisGui(QtWidgets.QWidget):
         setattr(self, f"container_By{axis_label}", container_by)
         hlay4.addWidget(container_by)
 
-        # Finally add Home and Stop buttons
-        for w in [btn_home, btn_stop]:
-            hlay4.addWidget(w)
-        hlay4.addStretch(1)
         ctrl_vlay.addLayout(hlay4)
         
         # ---- Row 5 & 6 removed: those controls now live in Row 1 ----
@@ -1228,8 +1297,17 @@ class MultiAxisGui(QtWidgets.QWidget):
         edit_pos.returnPressed.disconnect()
         edit_pos.editingFinished.connect(lambda ax=axis_label: self._move_to_position(ax))
         edit_step.editingFinished.connect(lambda ax=axis_label: self._press_enter_step(ax))
+        edit_step.editingFinished.connect(
+            lambda ax=axis_label, sb=edit_step: self.logger.info(f"{ax}-axis step size set to {sb.value():.1f} µm")
+        )
         edit_vel.editingFinished.connect(lambda ax=axis_label: self._press_enter_velocity(ax))
+        edit_vel.editingFinished.connect(
+            lambda ax=axis_label, e=edit_vel: self.logger.info(f"{ax}-axis jog velocity set to {float(e.text()):.2f} µm/s")
+        )
         edit_acc.editingFinished.connect(lambda ax=axis_label: self._press_enter_accel(ax))
+        edit_acc.editingFinished.connect(
+            lambda ax=axis_label, e=edit_acc: self.logger.info(f"{ax}-axis jog acceleration set to {float(e.text()):.2f} µm/s²")
+        )
         
         btn_home.clicked.connect(lambda _, ax=axis_label: self._home_clicked(ax))
         btn_stop.clicked.connect(lambda _, ax=axis_label: self._stop_clicked(ax))
@@ -1316,6 +1394,10 @@ class MultiAxisGui(QtWidgets.QWidget):
         for i,v in enumerate(filtered):
             filtered[i] = filtered[i].split(' --> ')[0]
         combo.addItems(filtered)
+        
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        combo.setMinimumWidth(combo.sizeHint().width())
 
     @QtCore.pyqtSlot(str, bool)
     def _on_connection_status_change(self, axis: str, connected: bool):
@@ -1395,6 +1477,11 @@ class MultiAxisGui(QtWidgets.QWidget):
         if hasattr(w, 'clearFocus'):
             w.clearFocus()
         self.setFocus()
+        
+    def _reset_all_motors(self):
+        """Called by the Shift+Space QShortcut."""
+        for axis in ("X", "Y", "Z"):
+            self._on_reset_homing(axis)
 
     def _update_preset_button_state(self):
         """Enable Go to Preset only when both X and Y are connected."""
@@ -1542,6 +1629,8 @@ class MultiAxisGui(QtWidgets.QWidget):
             if axis == "Z":
                 self.combo_DriveProfileZ.hide()
                 self.btn_EditDriveProfilesZ.hide()
+            # whenever we switch back to Jog, force Continuous sub‐mode on
+            getattr(self, f"radio_Cont{axis}").setChecked(True)
                 
     def _apply_jog_preset(self, axis: str, which: str):
         """
@@ -1752,6 +1841,7 @@ class MultiAxisGui(QtWidgets.QWidget):
         if dlg.exec_() == QDialog.Accepted:
             # dialog now only returns the 4-profile dict
             self.drive_profiles = dlg.getValues()
+            self.logger.info(f"Drive profiles updated: {self.drive_profiles}")
             
     def _apply_preset_dict(self, data: dict, show_message: bool=True):
         # 1) Extract—and treat data['x'],['y'] as µm:
@@ -1939,10 +2029,6 @@ class MultiAxisGui(QtWidgets.QWidget):
                 iface.stop_any_movement()
                 self._poll_until_settled(ax)
             return
-        
-        if event.key() == QtCore.Qt.Key_Shift and not event.isAutoRepeat():
-            for axis in ("X", "Y", "Z"):
-                self._on_reset_homing(axis)
         super().keyPressEvent(event)
         
     def keyReleaseEvent(self, event: QtGui.QKeyEvent):
@@ -2048,6 +2134,129 @@ def main():
     use_virtual = args.virtual
 
     app = QtWidgets.QApplication(sys.argv)
+    
+    # 1) Global dark palette and style‐sheet
+    dark_ss = """
+    /* Base background and text */
+    QWidget {
+        background-color: #2e2e2e;
+        color: #ffffff;
+    }
+
+    /* Main window border */
+    QMainWindow {
+        border: 1px solid #444444;
+    }
+
+    /* Group-boxes */
+    QGroupBox {
+        border: 1px solid #444444;
+        margin-top: 0.6em;
+        padding: 0.3em;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        padding: 0 3px;
+    }
+
+    /* Line-edits, spin-boxes, combo-boxes, text-edits */
+    QLineEdit, QSpinBox, QDoubleSpinBox,
+    QTextEdit, QPlainTextEdit {
+        background-color: #3c3c3c;
+        border: 1px solid #555555;
+        selection-background-color: #555555;
+        selection-color: #ffffff;
+    }
+    
+    QComboBox {
+        background-color: #3c3c3c;
+        border: 1px solid #555555;
+        padding: 2px;
+    }
+    
+    QComboBox QAbstractItemView {
+        background-color: #3c3c3c;
+        border: 1px solid #555555;
+        selection-background-color: #555555;
+        selection-color: #ffffff;
+    }
+
+    QRadioButton, QCheckBox {
+        spacing: 5px;
+    }
+    
+    QRadioButton::indicator {
+        width: 16px;
+        height: 16px;
+        border: 1px solid #888888;
+        border-radius: 8px;
+        background: #2e2e2e;
+    }
+    
+    QCheckBox::indicator {
+        width: 16px;
+        height: 16px;
+        border: 1px solid #888888;
+        border-radius: 2px;
+        background: #2e2e2e;
+    }
+    
+    QRadioButton::indicator:unchecked,
+    QCheckBox::indicator:unchecked {
+        width: 16px; height: 16px;
+        border: 1px solid #888888;
+        background: #2e2e2e;
+    }
+    
+    QRadioButton::indicator:checked {
+        background: #007ACC;
+    }
+    
+    QCheckBox::indicator:checked {
+        background: #007ACC;
+    }
+
+    # /* Spin-box up/down arrows */
+    # QSpinBox::up-button, QDoubleSpinBox::up-button,
+    # QSpinBox::down-button, QDoubleSpinBox::down-button {
+    #     subcontrol-origin: border;
+    #     subcontrol-position: top right;
+    #     width: 16px;
+    #     border-left: 1px solid #555555;
+    # }
+
+    /* Push-buttons */
+    QPushButton {
+        background-color: #444444;
+        border: 1px solid #555555;
+        padding: 4px 8px;
+    }
+    QPushButton:hover {
+        background-color: #555555;
+    }
+    QPushButton:pressed {
+        background-color: #666666;
+    }
+    QPushButton:disabled {
+        background-color: #2e2e2e;
+        color: #777777;
+    }
+
+    /* — in addition to your red “Stop” buttons: */
+    QPushButton.stop-button {
+        background-color: #c62828;
+        color: #ffffff;
+        font-weight: bold;
+    }
+
+    /* Menu bar & toolbars */
+    QMenuBar, QMenu, QToolBar {
+        background-color: #333333;
+        border: none;
+    }
+    """
+    app.setStyleSheet(dark_ss)
 
     # Instantiate three interfaces, one for X, one for Y, one for Z:
     iface_x = interface(use_virtual=use_virtual)
@@ -2056,8 +2265,13 @@ def main():
 
     window = MainWindow()
     gui3 = MultiAxisGui(iface_x, iface_y, iface_z, parent=window)
+    gui3.logger = logging.getLogger("pyStack")
     window.setCentralWidget(gui3)
     window.resize(760, 900)
+    
+    for axis in ('X','Y','Z'):
+        btn = getattr(gui3, f"button_Stop{axis}")
+        btn.setProperty("class", "stop-button")
 
     print(f"[DEBUG] {time.strftime('%H:%M:%S')}  :  About to call window.show() and app.exec_().")
     window.setMinimumWidth(window.width())
